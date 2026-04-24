@@ -1,0 +1,92 @@
+name: yt2fb
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: YouTube URL
+        required: true
+        type: string
+      mode:
+        description: draft or publish
+        required: true
+        default: draft
+        type: choice
+        options:
+          - draft
+          - publish
+      confirm_publish:
+        description: Must be true to publish
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    outputs:
+      preview_created: ${{ steps.draft.outputs.preview_created }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate draft
+        id: draft
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4.1-mini' }}
+        run: |
+          python yt2fb.py draft "${{ inputs.youtube_url }}"
+          echo "preview_created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yt2fb-preview
+          path: |
+            preview.md
+            run.json
+
+      - name: Print preview to job summary
+        run: |
+          echo "# yt2fb preview" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat preview.md >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    if: ${{ inputs.mode == 'publish' && inputs.confirm_publish == true }}
+    needs: draft
+    runs-on: ubuntu-latest
+    environment: facebook-publish
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download preview artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: yt2fb-preview
+          path: .
+
+      - name: Publish to Facebook
+        env:
+          META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
+          META_PAGE_ACCESS_TOKEN: ${{ secrets.META_PAGE_ACCESS_TOKEN }}
+          META_GRAPH_VERSION: ${{ secrets.META_GRAPH_VERSION || 'v20.0' }}
+        run: python yt2fb.py publish "${{ inputs.youtube_url }}" --confirm
