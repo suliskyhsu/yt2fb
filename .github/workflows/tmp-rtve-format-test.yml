@@ -1,0 +1,81 @@
+name: tmp-rtve-format-test
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+    paths:
+      - '.github/workflows/tmp-rtve-format-test.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install tools
+        run: |
+          pip install -q 'yt-dlp[default,curl-cffi]' requests
+          sudo apt-get update -qq && sudo apt-get install -y ffmpeg >/dev/null
+      - name: Inspect and test formats
+        run: |
+          mkdir -p out
+          URL='https://www.rtve.es/play/videos/vuelta-ciclista-a-espana/2026-etapa-4-andorra-vella-andorra-vella-1049-km-montana/17201825/'
+          yt-dlp -v --skip-download --dump-single-json "$URL" > out/full.json 2> out/yt_debug.txt
+          yt-dlp -F "$URL" > out/formats.txt 2>&1 || true
+          cat > /tmp/test.py <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          import requests
+
+          data=json.loads(Path('out/full.json').read_text())
+          simplified=[]
+          for f in data.get('formats',[]):
+              simplified.append({k:f.get(k) for k in ('format_id','format','ext','protocol','vcodec','acodec','width','height','tbr','abr','filesize','filesize_approx','url','manifest_url','http_headers')})
+          Path('out/formats.json').write_text(json.dumps(simplified,ensure_ascii=False,indent=2))
+
+          results=[]
+          for f in data.get('formats',[]):
+              url=f.get('url')
+              if not url: continue
+              headers={'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140 Safari/537.36','Referer':'https://www.rtve.es/','Origin':'https://www.rtve.es'}
+              headers.update(f.get('http_headers') or {})
+              try:
+                  r=requests.get(url,headers={**headers,'Range':'bytes=0-2047'},timeout=20,allow_redirects=True)
+                  results.append({'format_id':f.get('format_id'),'protocol':f.get('protocol'),'status':r.status_code,'len':len(r.content),'content_type':r.headers.get('content-type'),'final_url':r.url,'first':r.text[:120] if 'text' in (r.headers.get('content-type') or '') or 'mpegurl' in (r.headers.get('content-type') or '') else None})
+              except Exception as e:
+                  results.append({'format_id':f.get('format_id'),'protocol':f.get('protocol'),'error':repr(e)})
+          Path('out/http_tests.json').write_text(json.dumps(results,ensure_ascii=False,indent=2))
+          print(json.dumps(results,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/test.py
+
+          # Try several downloader/header combinations, stop after one works
+          for MODE in hls direct impersonate headers ffmpeg; do
+            rm -f out/test.*
+            echo "=== $MODE ===" | tee -a out/download_attempts.txt
+            set +e
+            case "$MODE" in
+              hls) yt-dlp --no-warnings -f 'best[protocol*=m3u8]/bestaudio[protocol*=m3u8]' --downloader native --download-sections '*00:00-00:20' -o 'out/test.%(ext)s' "$URL" >>out/download_attempts.txt 2>&1 ;;
+              direct) yt-dlp --no-warnings -f 'best[protocol=http]/bestaudio[protocol=http]' --download-sections '*00:00-00:20' -o 'out/test.%(ext)s' "$URL" >>out/download_attempts.txt 2>&1 ;;
+              impersonate) yt-dlp --impersonate chrome --no-warnings --download-sections '*00:00-00:20' -o 'out/test.%(ext)s' "$URL" >>out/download_attempts.txt 2>&1 ;;
+              headers) yt-dlp --add-header 'Referer:https://www.rtve.es/' --add-header 'Origin:https://www.rtve.es' --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140 Safari/537.36' --no-warnings --download-sections '*00:00-00:20' -o 'out/test.%(ext)s' "$URL" >>out/download_attempts.txt 2>&1 ;;
+              ffmpeg) yt-dlp --downloader ffmpeg --downloader-args 'ffmpeg_i:-headers Referer\: https\://www.rtve.es/ -user_agent Mozilla/5.0' --no-warnings --download-sections '*00:00-00:20' -o 'out/test.%(ext)s' "$URL" >>out/download_attempts.txt 2>&1 ;;
+            esac
+            RC=$?
+            set -e
+            echo "rc=$RC" | tee -a out/download_attempts.txt
+            if find out -maxdepth 1 -name 'test.*' -type f -size +100k | grep -q .; then
+              find out -maxdepth 1 -name 'test.*' -type f -printf '%f %s bytes\n' | tee -a out/download_attempts.txt
+              break
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rtve-format-test
+          path: out/
+          retention-days: 1
