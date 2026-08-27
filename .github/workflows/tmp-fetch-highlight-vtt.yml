@@ -1,0 +1,26 @@
+name: tmp-fetch-rtve-highlight-vtt
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+    paths:
+      - '.github/workflows/tmp-fetch-highlight-vtt.yml'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download official Spanish highlight VTT
+        run: |
+          mkdir -p out
+          curl -fL --retry 3 -A 'Mozilla/5.0' 'https://www.rtve.es/resources/vtt/7/3/1787672048137.vtt' -o out/highlight_es.vtt
+          wc -c -l out/highlight_es.vtt
+          head -30 out/highlight_es.vtt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtve-highlight-spanish-vtt
+          path: out/highlight_es.vtt
+          retention-days: 1
