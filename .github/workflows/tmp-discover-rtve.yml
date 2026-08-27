@@ -1,0 +1,123 @@
+name: tmp-discover-rtve-stage4
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install discovery tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp requests beautifulsoup4
+
+      - name: Discover RTVE stage 4 video URLs
+        run: |
+          mkdir -p out
+          cat > /tmp/discover.py <<'PY'
+          import html as htmlmod
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          PAGES = [
+              'https://www.rtve.es/play/teledeporte/ciclismo/',
+              'https://www.rtve.es/play/vuelta-ciclista-espana/',
+              'https://www.rtve.es/play/videos/vuelta-ciclista-a-espana/',
+              'https://www.rtve.es/play/colecciones/vuelta-ciclista-espana-2026-resumenes-etapas/4907/',
+              'https://www.rtve.es/deportes/ciclismo/vuelta-espana/',
+              'https://www.rtve.es/temas/vuelta-ciclista-a-espana/49290/',
+          ]
+          HEADERS = {'User-Agent': 'Mozilla/5.0'}
+          urls = set()
+          logs = []
+
+          for page in PAGES:
+              try:
+                  r = requests.get(page, headers=HEADERS, timeout=30)
+                  logs.append(f'{page}\t{r.status_code}\t{len(r.content)}')
+                  Path('out').mkdir(exist_ok=True)
+                  Path('out/' + re.sub(r'[^A-Za-z0-9]+', '_', page).strip('_')[:80] + '.html').write_bytes(r.content)
+                  text = htmlmod.unescape(r.text)
+                  soup = BeautifulSoup(text, 'html.parser')
+                  for a in soup.find_all('a', href=True):
+                      href = urljoin(page, a['href'])
+                      label = ' '.join(a.stripped_strings).lower()
+                      if '/play/videos/' in href and (
+                          'andorra' in label or 'etapa 4' in label or 'vuelta' in href.lower()
+                      ):
+                          urls.add(href.split('?')[0])
+                  for match in re.findall(r'https?://[^\"\'<> ]+|/play/videos/[^\"\'<> ]+', text):
+                      href = urljoin(page, match).split('?')[0]
+                      low = href.lower()
+                      if '/play/videos/' in low and ('vuelta' in low or 'andorra' in low):
+                          urls.add(href)
+              except Exception as exc:
+                  logs.append(f'{page}\tERROR\t{exc!r}')
+
+          # A known stage-4 highlight provides a nearby media ID and a guaranteed extractor test.
+          urls.add('https://www.rtve.es/play/videos/vuelta-ciclista-a-espana/pogacar-se-impone-andorra-recital-50-km-escapada-solitario/17201785/')
+
+          Path('out/fetch_log.txt').write_text('\n'.join(logs), encoding='utf-8')
+          Path('out/candidate_urls.txt').write_text('\n'.join(sorted(urls)), encoding='utf-8')
+
+          records = []
+          for url in sorted(urls):
+              try:
+                  proc = subprocess.run(
+                      ['yt-dlp', '--no-warnings', '--skip-download', '--dump-single-json', url],
+                      capture_output=True, text=True, timeout=90,
+                  )
+                  if proc.returncode == 0 and proc.stdout.strip():
+                      data = json.loads(proc.stdout)
+                      rec = {
+                          'url': url,
+                          'webpage_url': data.get('webpage_url'),
+                          'id': data.get('id'),
+                          'title': data.get('title'),
+                          'duration': data.get('duration'),
+                          'extractor': data.get('extractor'),
+                          'subtitles': sorted((data.get('subtitles') or {}).keys()),
+                          'automatic_captions': sorted((data.get('automatic_captions') or {}).keys()),
+                      }
+                      records.append(rec)
+                  else:
+                      records.append({'url': url, 'error': (proc.stderr or proc.stdout)[-2000:]})
+              except Exception as exc:
+                  records.append({'url': url, 'error': repr(exc)})
+
+          Path('out/metadata.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          matches = []
+          for rec in records:
+              title = (rec.get('title') or '').lower()
+              duration = rec.get('duration') or 0
+              if ('andorra' in title and ('etapa 4' in title or 'resumen' in title)) or duration > 10000:
+                  matches.append(rec)
+          Path('out/likely_matches.json').write_text(json.dumps(matches, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          print(json.dumps(matches, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/discover.py
+
+      - name: Upload discovery output
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtve-stage4-discovery
+          path: out/
+          retention-days: 1
