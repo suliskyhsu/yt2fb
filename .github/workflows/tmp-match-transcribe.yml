@@ -1,0 +1,233 @@
+name: tmp-match-and-transcribe-spanish-clip
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+    paths:
+      - '.github/workflows/tmp-match-transcribe.yml'
+      - 'tmp/reference_small.json'
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install yt-dlp numpy scipy openai
+
+      - name: Download exact RTVE stage 4 commentary audio
+        run: |
+          mkdir -p out
+          URL='https://www.rtve.es/play/videos/vuelta-ciclista-a-espana/2026-etapa-4-andorra-vella-andorra-vella-1049-km-montana/17201825/'
+          yt-dlp --no-warnings -f 'bestaudio/best' -o 'out/source.%(ext)s' "$URL"
+          SRC=$(find out -maxdepth 1 -type f -name 'source.*' | head -n 1)
+          test -n "$SRC"
+          ffmpeg -hide_banner -loglevel error -y -i "$SRC" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/full_stage.wav
+          ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 out/full_stage.wav > out/full_stage_duration.txt
+
+      - name: Match uploaded clip against full-stage audio fingerprint
+        run: |
+          cat > /tmp/match.py <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+
+          import numpy as np
+          from scipy.io import wavfile
+          from scipy.signal import fftconvolve, get_window
+
+          cfg = json.loads(Path('tmp/reference_small.json').read_text())
+          sr = int(cfg['sr'])
+          win_s = float(cfg['win_s'])
+          hop_s = float(cfg['hop_s'])
+          n_mels = int(cfg['n_mels'])
+          fmin = float(cfg['fmin'])
+          fmax = float(cfg['fmax'])
+
+          def hz_to_mel(f):
+              return 2595.0 * np.log10(1.0 + f / 700.0)
+
+          def mel_to_hz(m):
+              return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+          def mel_fb(n_fft):
+              hz = mel_to_hz(np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2))
+              bins = np.clip(np.floor((n_fft + 1) * hz / sr).astype(int), 0, n_fft // 2)
+              out = np.zeros((n_mels, n_fft // 2 + 1), np.float32)
+              for i in range(n_mels):
+                  left, center, right = bins[i:i+3]
+                  center = max(center, left + 1)
+                  right = max(right, center + 1)
+                  center = min(center, n_fft // 2)
+                  right = min(right, n_fft // 2 + 1)
+                  if center > left:
+                      out[i, left:center] = (np.arange(left, center) - left) / (center - left)
+                  if right > center:
+                      out[i, center:right] = (right - np.arange(center, right)) / (right - center)
+              return out
+
+          def features_stream(x, batch_frames=512):
+              win = int(round(win_s * sr))
+              hop = int(round(hop_s * sr))
+              n_fft = 8192
+              window = get_window('hann', win, fftbins=True).astype(np.float32)
+              fb = mel_fb(n_fft)
+              n_frames = 1 + (len(x) - win) // hop
+              result = np.empty((n_frames, n_mels), np.float32)
+              base = np.arange(win, dtype=np.int64)
+              for first in range(0, n_frames, batch_frames):
+                  last = min(first + batch_frames, n_frames)
+                  starts = hop * np.arange(first, last, dtype=np.int64)
+                  frames = x[starts[:, None] + base[None, :]] * window[None, :]
+                  spec = np.fft.rfft(frames, n=n_fft, axis=1)
+                  power = (spec.real ** 2 + spec.imag ** 2).astype(np.float32)
+                  z = np.log1p(power @ fb.T)
+                  z -= z.mean(axis=1, keepdims=True)
+                  z /= np.linalg.norm(z, axis=1, keepdims=True) + 1e-6
+                  result[first:last] = z
+              return result
+
+          wav_sr, audio = wavfile.read('out/full_stage.wav')
+          if wav_sr != sr:
+              raise RuntimeError(f'Unexpected sample rate {wav_sr}')
+          if audio.ndim > 1:
+              audio = audio.mean(axis=1)
+          audio = audio.astype(np.float32)
+          audio /= max(1.0, float(np.max(np.abs(audio))))
+          source = features_stream(audio)
+
+          estimates = []
+          diagnostics = []
+          for item in cfg['segments']:
+              shape = tuple(item['shape'])
+              ref = np.frombuffer(base64.b64decode(item['data_b64']), dtype=np.int8).reshape(shape).astype(np.float32) / 100.0
+              ref /= np.linalg.norm(ref, axis=1, keepdims=True) + 1e-6
+              score = np.zeros(source.shape[0] - ref.shape[0] + 1, np.float64)
+              for d in range(n_mels):
+                  score += fftconvolve(source[:, d], ref[::-1, d], mode='valid')
+              score /= ref.shape[0]
+              top_idx = np.argpartition(score, -5)[-5:]
+              top_idx = top_idx[np.argsort(score[top_idx])[::-1]]
+              best = int(top_idx[0])
+              reference_start = float(item['reference_start_s'])
+              clip_start = best * hop_s - reference_start
+              estimates.append(clip_start)
+              diagnostics.append({
+                  'reference_start_s': reference_start,
+                  'reference_end_s': float(item['reference_end_s']),
+                  'best_source_feature_index': best,
+                  'best_reference_source_time_s': best * hop_s,
+                  'estimated_clip_start_s': clip_start,
+                  'best_score': float(score[best]),
+                  'top_candidates': [
+                      {'source_time_s': float(i * hop_s), 'score': float(score[i])}
+                      for i in top_idx
+                  ],
+              })
+
+          estimates = np.asarray(estimates, dtype=float)
+          final_start = float(np.median(estimates))
+          spread = float(np.max(estimates) - np.min(estimates))
+          result = {
+              'estimated_clip_start_in_full_stage_s': final_start,
+              'estimate_spread_s': spread,
+              'clip_duration_s': 180.789,
+              'diagnostics': diagnostics,
+          }
+          Path('out/match.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
+          Path('out/clip_start.txt').write_text(f'{final_start:.3f}')
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+          if spread > 2.0:
+              raise RuntimeError(f'Fingerprint estimates disagree by {spread:.3f}s')
+          PY
+          python /tmp/match.py
+
+      - name: Extract matching public-source audio segment
+        run: |
+          START=$(cat out/clip_start.txt)
+          ffmpeg -hide_banner -loglevel error -y -ss "$START" -i out/full_stage.wav -t 180.789 -ac 1 -ar 16000 -b:a 64k out/matched_clip.mp3
+          ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 out/matched_clip.mp3 > out/matched_clip_duration.txt
+
+      - name: Transcribe with OpenAI Whisper
+        run: |
+          cat > /tmp/transcribe.py <<'PY'
+          import json
+          from pathlib import Path
+          from openai import OpenAI
+
+          client = OpenAI()
+          prompt = (
+              'Retransmisión ciclista de La Vuelta a España 2026 en Andorra. '
+              'Nombres probables: Tadej Pogačar, Felix Gall, Jarno Widar, UAE Team Emirates-XRG, '
+              'Collada de Beixalís, Andorra la Vella, Carlos de Andrés, Pedro Delgado.'
+          )
+          with open('out/matched_clip.mp3', 'rb') as f:
+              response = client.audio.transcriptions.create(
+                  model='whisper-1',
+                  file=f,
+                  language='es',
+                  prompt=prompt,
+                  temperature=0,
+                  response_format='verbose_json',
+              )
+
+          if hasattr(response, 'model_dump'):
+              data = response.model_dump()
+          elif isinstance(response, dict):
+              data = response
+          else:
+              data = json.loads(response.json())
+          Path('out/transcript_verbose.json').write_text(json.dumps(data, ensure_ascii=False, indent=2))
+          text = (data.get('text') or '').strip()
+          Path('out/transcript.txt').write_text(text + '\n')
+
+          def srt_time(value):
+              ms = int(round(float(value) * 1000))
+              h, ms = divmod(ms, 3600000)
+              m, ms = divmod(ms, 60000)
+              s, ms = divmod(ms, 1000)
+              return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+
+          segments = data.get('segments') or []
+          srt = []
+          timed = []
+          for number, seg in enumerate(segments, 1):
+              start = float(seg.get('start', 0))
+              end = float(seg.get('end', start))
+              line = (seg.get('text') or '').strip()
+              if not line:
+                  continue
+              srt.extend([str(number), f'{srt_time(start)} --> {srt_time(end)}', line, ''])
+              timed.append(f'[{start:06.1f}–{end:06.1f}] {line}')
+          Path('out/transcript.srt').write_text('\n'.join(srt))
+          Path('out/transcript_timed.txt').write_text('\n'.join(timed) + '\n')
+          print(text)
+          PY
+          python /tmp/transcribe.py
+
+      - name: Upload verified transcript output
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-spanish-transcript
+          path: |
+            out/match.json
+            out/full_stage_duration.txt
+            out/matched_clip_duration.txt
+            out/transcript_verbose.json
+            out/transcript.txt
+            out/transcript_timed.txt
+            out/transcript.srt
+          retention-days: 1
