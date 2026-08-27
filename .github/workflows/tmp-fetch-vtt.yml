@@ -1,0 +1,26 @@
+name: tmp-fetch-rtve-stage4-vtt
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+    paths:
+      - '.github/workflows/tmp-fetch-vtt.yml'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download official Spanish VTT
+        run: |
+          mkdir -p out
+          curl -fL --retry 3 -A 'Mozilla/5.0' 'https://www.rtve.es/resources/vtt/2/1/0/0/01787737750012.vtt' -o out/stage4_es.vtt
+          wc -c -l out/stage4_es.vtt
+          head -30 out/stage4_es.vtt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtve-stage4-spanish-vtt
+          path: out/stage4_es.vtt
+          retention-days: 1
