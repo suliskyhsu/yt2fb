@@ -1,0 +1,40 @@
+name: tmp-fetch-rtve-subtitles
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+    paths:
+      - '.github/workflows/tmp-rtve-subs.yml'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch RTVE subtitle APIs
+        run: |
+          mkdir -p out
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          for vid in ('17201825','17201841','17201785'):
+              u=f'https://api2.rtve.es/api/videos/{vid}/subtitulos.json'
+              req=Request(u, headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
+              try:
+                  with urlopen(req, timeout=30) as r:
+                      b=r.read()
+                      Path(f'out/{vid}.json').write_bytes(b)
+                      print(vid, r.status, len(b), b[:300])
+              except Exception as e:
+                  Path(f'out/{vid}.error.txt').write_text(repr(e))
+                  print(vid, 'ERROR', repr(e))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rtve-subtitle-api
+          path: out/
+          retention-days: 1
