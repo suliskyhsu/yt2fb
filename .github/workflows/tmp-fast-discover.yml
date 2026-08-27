@@ -1,0 +1,80 @@
+name: tmp-fast-discover-rtve-stage4
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q requests beautifulsoup4 yt-dlp
+      - name: Find exact stage 4 links
+        run: |
+          mkdir -p out
+          cat > /tmp/fast.py <<'PY'
+          import json, re, subprocess
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          pages = [
+            'https://www.rtve.es/play/teledeporte/ciclismo/',
+            'https://www.rtve.es/play/vuelta-ciclista-espana/',
+            'https://www.rtve.es/deportes/ciclismo/vuelta-espana/',
+            'https://www.rtve.es/play/colecciones/vuelta-ciclista-espana-2026-resumenes-etapas/4907/',
+          ]
+          exact=[]
+          all_video=[]
+          for page in pages:
+            r=requests.get(page,headers={'User-Agent':'Mozilla/5.0'},timeout=30)
+            Path('out/page_'+str(len(exact))+'.html').write_bytes(r.content)
+            soup=BeautifulSoup(r.text,'html.parser')
+            for a in soup.find_all('a',href=True):
+              label=' '.join(a.stripped_strings).strip()
+              href=urljoin(page,a['href']).split('?')[0]
+              if '/play/videos/' in href:
+                all_video.append({'label':label,'url':href})
+                low=label.lower()
+                if ('etapa 4' in low and 'andorra' in low) or ('resumen' in low and 'andorra' in low):
+                  exact.append({'label':label,'url':href})
+          # dedupe
+          seen=set(); exact=[x for x in exact if not (x['url'] in seen or seen.add(x['url']))]
+          Path('out/exact_links.json').write_text(json.dumps(exact,ensure_ascii=False,indent=2))
+          Path('out/all_video_links.json').write_text(json.dumps(all_video,ensure_ascii=False,indent=2))
+          print('EXACT LINKS')
+          print(json.dumps(exact,ensure_ascii=False,indent=2))
+
+          meta=[]
+          for item in exact[:12]:
+            try:
+              p=subprocess.run(['yt-dlp','--skip-download','--dump-single-json','--no-warnings',item['url']],capture_output=True,text=True,timeout=45)
+              if p.returncode==0:
+                d=json.loads(p.stdout)
+                meta.append({
+                  'source_label':item['label'],'source_url':item['url'],
+                  'id':d.get('id'),'title':d.get('title'),'duration':d.get('duration'),
+                  'webpage_url':d.get('webpage_url'),'subtitles':list((d.get('subtitles') or {}).keys()),
+                  'automatic_captions':list((d.get('automatic_captions') or {}).keys())
+                })
+              else:
+                meta.append({'source_url':item['url'],'error':p.stderr[-1000:]})
+            except Exception as e:
+              meta.append({'source_url':item['url'],'error':repr(e)})
+          Path('out/meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2))
+          print('META')
+          print(json.dumps(meta,ensure_ascii=False,indent=2))
+          PY
+          python /tmp/fast.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtve-fast-discovery
+          path: out/
+          retention-days: 1
