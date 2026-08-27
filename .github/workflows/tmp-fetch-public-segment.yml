@@ -1,0 +1,121 @@
+name: tmp-fetch-rtve-public-segment
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+    paths:
+      - '.github/workflows/tmp-fetch-public-segment.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          pip install -q requests
+      - name: Resolve RTVE media URLs
+        run: |
+          mkdir -p out
+          python - <<'PY'
+          import base64, io, struct, requests, json
+          from pathlib import Path
+
+          def get_alphabet(data):
+              alphabet=[]; e=0; d=0
+              for char in data.decode('iso-8859-1'):
+                  if d==0:
+                      alphabet.append(char); d=e=(e+1)%4
+                  else:
+                      d-=1
+              return alphabet
+          def get_url(alphabet, data):
+              url=''; f=0; e=3; b=1
+              for char in data.decode('iso-8859-1'):
+                  if f==0:
+                      l=int(char)*10; f=1
+                  else:
+                      if e==0:
+                          l+=int(char); url+=alphabet[l]; e=(b+3)%4; f=0; b+=1
+                      else: e-=1
+              return url
+          def decrypt(png_bytes):
+              # yt-dlp's RTVE decrypter; response may be raw PNG or base64 text
+              try:
+                  raw=base64.b64decode(png_bytes, validate=False)
+                  if raw.startswith(b'\x89PNG'):
+                      png=raw
+                  elif png_bytes.startswith(b'\x89PNG'):
+                      png=png_bytes
+                  else:
+                      png=raw
+              except Exception:
+                  png=png_bytes
+              bio=io.BytesIO(png[8:])
+              result=[]
+              while True:
+                  ld=bio.read(4)
+                  if len(ld)<4: break
+                  length=struct.unpack('!I',ld)[0]
+                  ctype=bio.read(4); data=bio.read(length); bio.read(4)
+                  if ctype==b'IEND': break
+                  if ctype==b'tEXt':
+                      data=bytes(filter(None,data))
+                      ad,_,ud=data.partition(b'#')
+                      quality,_,ud=ud.rpartition(b'%%')
+                      result.append((quality.decode(errors='ignore'),get_url(get_alphabet(ad),ud)))
+              return result
+
+          vid='17201825'
+          out=[]
+          for manager in ['rtveplayw','default']:
+              for scheme in ['https','http']:
+                  u=f'{scheme}://www.rtve.es/ztnr/movil/thumbnail/{manager}/videos/{vid}.png?q=v2'
+                  try:
+                      r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=30)
+                      Path(f'out/{manager}_{scheme}.status.txt').write_text(f'{r.status_code}\n{r.headers}\n')
+                      Path(f'out/{manager}_{scheme}.bin').write_bytes(r.content)
+                      if r.ok:
+                          for q,url in decrypt(r.content): out.append({'manager':manager,'scheme':scheme,'quality':q,'url':url})
+                  except Exception as e:
+                      Path(f'out/{manager}_{scheme}.error.txt').write_text(repr(e))
+          # API probes
+          api_urls=[
+            f'https://www.rtve.es/api/videos/{vid}/config/alacarta_videos.json',
+            f'https://api2.rtve.es/api/videos/{vid}/subtitulos.json',
+            'https://api2.rtve.es/api/v2/play/videos/f82ec450-8016-433a-a821-d08179adec00',
+          ]
+          for i,u in enumerate(api_urls):
+              try:
+                  r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=30)
+                  Path(f'out/api_{i}.txt').write_text(f'URL {u}\nSTATUS {r.status_code}\nHEADERS {dict(r.headers)}\n\n{r.text[:200000]}',encoding='utf-8')
+              except Exception as e: Path(f'out/api_{i}.txt').write_text(repr(e))
+          Path('out/urls.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          if not out: raise SystemExit('No media URLs resolved')
+          Path('out/selected_url.txt').write_text(next((x['url'] for x in out if '.m3u8' in x['url']),out[0]['url']))
+          PY
+      - name: Extract candidate broadcast segment
+        run: |
+          u=$(cat out/selected_url.txt)
+          printf '%s\n' "$u"
+          ffmpeg -y -ss 01:49:10 -i "$u" -t 00:03:45 -vn -ac 1 -ar 16000 -c:a pcm_s16le out/candidate.wav
+          ffmpeg -y -i out/candidate.wav -c:a libopus -b:a 32k out/candidate.opus
+          ffprobe -v error -show_entries format=duration,size -of default=nw=1 out/candidate.wav
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rtve-stage4-public-segment
+          path: out/
+          retention-days: 1
+          if-no-files-found: warn
