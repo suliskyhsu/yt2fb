@@ -1,0 +1,151 @@
+name: tmp-fetch-rtve-scd-segment
+
+on:
+  push:
+    branches:
+      - tmp-spanish-transcript-20260827-v2
+    paths:
+      - '.github/workflows/tmp-fetch-scd-segment.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          pip install -q requests
+      - name: Resolve legacy SCD asset
+        run: |
+          set -x
+          mkdir -p out
+          ASSET_ID=8358970
+          XML='https://www.rtve.es/scd/CONTENTS/ASSET_DATA_VIDEO/0/7/9/8/ASSET_DATA_VIDEO-8358970.xml'
+          curl -fL --retry 3 --connect-timeout 20 -A 'Mozilla/5.0' -e 'https://www.rtve.es/' "$XML" -o out/asset.xml || true
+          wc -c out/asset.xml || true
+          head -80 out/asset.xml || true
+          python - <<'PY'
+          import json, re, urllib.parse
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          p=Path('out/asset.xml')
+          text=p.read_text(encoding='utf-8',errors='replace') if p.exists() else ''
+          records=[]
+          values=[]
+          try:
+              root=ET.fromstring(text)
+              elems=list(root.iter())
+              for i,e in enumerate(elems):
+                  tag=e.tag.rsplit('}',1)[-1]
+                  val=(e.text or '').strip()
+                  if tag.lower()=='key' and val:
+                      nxt=''
+                      for j in range(i+1,min(i+5,len(elems))):
+                          t=elems[j].tag.rsplit('}',1)[-1].lower()
+                          if t in ('value','string') and (elems[j].text or '').strip():
+                              nxt=(elems[j].text or '').strip(); break
+                      records.append({'key':val,'value':nxt})
+                  if tag.lower() in ('value','string') and val:
+                      values.append(val)
+          except Exception as exc:
+              records.append({'parse_error':repr(exc)})
+
+          # Regex fallback
+          for m in re.finditer(r'<key[^>]*>(.*?)</key>\s*<(?:value|string)[^>]*>(.*?)</(?:value|string)>',text,re.S|re.I):
+              records.append({'key':re.sub('<.*?>','',m.group(1)).strip(),'value':re.sub('<.*?>','',m.group(2)).strip()})
+          values += re.findall(r'https?://[^\s<"\']+',text)
+          values += [r.get('value','') for r in records if isinstance(r,dict)]
+
+          candidates=[]
+          def add(u,why):
+              if not u: return
+              u=u.replace('&amp;','&').strip()
+              if not u: return
+              if u.startswith('//'): u='https:'+u
+              if u.startswith('http://'): u='https://'+u[7:]
+              if u.startswith('/'):
+                  candidates.append({'url':'https://www.rtve.es'+u,'why':why+' + rtve root'})
+                  candidates.append({'url':'https://www.rtve.es/resources/TE_NGVA'+u,'why':why+' + TE_NGVA'})
+              elif u.startswith('http'):
+                  candidates.append({'url':u,'why':why})
+              else:
+                  candidates.append({'url':'https://www.rtve.es/resources/TE_NGVA/'+u.lstrip('/'),'why':why+' + TE_NGVA'})
+                  candidates.append({'url':'https://www.rtve.es/'+u.lstrip('/'),'why':why+' + rtve root'})
+
+          for r in records:
+              if isinstance(r,dict) and r.get('value'):
+                  add(r['value'],'key='+r.get('key',''))
+          for v in values: add(v,'xml value')
+
+          # Known legacy construction: keep path after the media host/resource marker.
+          extra=[]
+          for c in candidates:
+              u=c['url']
+              parsed=urllib.parse.urlparse(u)
+              path=parsed.path
+              for marker in ['/resources/','/TE_NGVA/','/CONTENTS/']:
+                  if marker in path:
+                      tail=path[path.find(marker):]
+                      extra += [
+                          {'url':'https://www.rtve.es'+tail,'why':'tail '+marker},
+                          {'url':'https://www.rtve.es/resources/TE_NGVA'+tail,'why':'TE_NGVA tail '+marker},
+                      ]
+          candidates += extra
+          # Add resolved HLS with headers as a fallback.
+          candidates.append({'url':'https://rtvehlslivestream.akamaized.net/rtvesec/teledeporte2/17201825/8943188/teledeporte2_1500.m3u8','why':'resolved HLS'})
+
+          seen=set(); unique=[]
+          for c in candidates:
+              u=c['url']
+              if u not in seen:
+                  seen.add(u); unique.append(c)
+          Path('out/records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/candidates.json').write_text(json.dumps(unique,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/candidates.txt').write_text('\n'.join(c['url'] for c in unique),encoding='utf-8')
+          print(json.dumps(unique,ensure_ascii=False,indent=2))
+          PY
+      - name: Probe and extract candidate segment
+        run: |
+          set +e
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
+          REF='https://www.rtve.es/play/videos/vuelta-ciclista-a-espana/2026-etapa-4-andorra-vella-andorra-vella-1049-km-montana/17201825/'
+          n=0
+          while IFS= read -r u; do
+            [ -z "$u" ] && continue
+            n=$((n+1))
+            echo "===== CANDIDATE $n =====" | tee -a out/probes.txt
+            echo "$u" | tee -a out/probes.txt
+            curl -IL --max-time 25 -A "$UA" -e "$REF" "$u" >> out/probes.txt 2>&1
+            ffprobe -v error -headers "User-Agent: $UA\r\nReferer: $REF\r\nOrigin: https://www.rtve.es\r\n" -show_entries format=duration,size,format_name -of json "$u" > "out/probe_${n}.json" 2> "out/probe_${n}.err"
+            if [ $? -eq 0 ]; then
+              echo "$u" > out/selected_url.txt
+              echo "$n" > out/selected_number.txt
+              ffmpeg -y -headers "User-Agent: $UA\r\nReferer: $REF\r\nOrigin: https://www.rtve.es\r\n" -ss 01:49:05 -i "$u" -t 00:04:10 -vn -ac 1 -ar 16000 -c:a pcm_s16le out/candidate.wav > out/ffmpeg.log 2>&1
+              if [ -s out/candidate.wav ]; then
+                ffmpeg -y -i out/candidate.wav -c:a libopus -b:a 48k out/candidate.opus >/dev/null 2>&1
+                break
+              fi
+            fi
+          done < out/candidates.txt
+          ls -lh out/
+          if [ ! -s out/candidate.wav ]; then
+            echo 'No candidate segment extracted' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rtve-scd-stage4-segment
+          path: out/
+          retention-days: 1
+          if-no-files-found: warn
