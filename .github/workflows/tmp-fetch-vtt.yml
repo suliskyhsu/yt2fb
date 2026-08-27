@@ -24,3 +24,5 @@ jobs:
           name: rtve-stage4-spanish-vtt
           path: out/stage4_es.vtt
           retention-days: 1
+
+# retrigger 2026-08-27
